@@ -1,11 +1,24 @@
+#  install
+#  -------
+#
+#  ```
+#  virtualenv --python=python3 ./env_3
+#  source ./env_3/bin/activate
+#  pip install mwclient
+#  ```
+
 import mwclient
 import argparse
 import os
 import time
 import glob
+import subprocess
 
-from util.util import get_git, call_git
+def call_git(args, **kwargs):
+    subprocess.check_call(['git'] + args, **kwargs)
 
+def get_git(args):
+    return subprocess.check_output(['git'] + args, universal_newlines=True).strip()
 
 def main():
     THIS_FILE_PATH = os.path.abspath(os.path.dirname(os.path.realpath(__file__)))

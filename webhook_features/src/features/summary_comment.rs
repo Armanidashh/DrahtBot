@@ -70,7 +70,11 @@ impl Feature for SummaryCommentFeature {
                 let pr_number = payload["number"]
                     .as_u64()
                     .ok_or(DrahtBotError::KeyNotFound)?;
-                refresh_summary_comment(ctx, repo, pr_number).await?
+                let diff_url = payload["pull_request"]["diff_url"]
+                    .as_str()
+                    .ok_or(DrahtBotError::KeyNotFound)?
+                    .to_string();
+                refresh_summary_comment(ctx, repo, pr_number, Some(diff_url)).await?
             }
             GitHubEvent::IssueComment if payload["issue"].get("pull_request").is_some() => {
                 // https://docs.github.com/en/developers/webhooks-and-events/webhooks/webhook-events-and-payloads#issue_comment
@@ -86,7 +90,7 @@ impl Feature for SummaryCommentFeature {
                     == "open"
                     && comment_author != ctx.bot_username
                 {
-                    refresh_summary_comment(ctx, repo, pr_number).await?
+                    refresh_summary_comment(ctx, repo, pr_number, None).await?
                 }
             }
             GitHubEvent::PullRequestReview => {
@@ -99,7 +103,7 @@ impl Feature for SummaryCommentFeature {
                     .ok_or(DrahtBotError::KeyNotFound)?
                     == "open"
                 {
-                    refresh_summary_comment(ctx, repo, pr_number).await?
+                    refresh_summary_comment(ctx, repo, pr_number, None).await?
                 }
             }
             _ => {}
@@ -109,12 +113,13 @@ impl Feature for SummaryCommentFeature {
 }
 
 fn summary_comment_template(reviews: Vec<Review>) -> String {
-    let mut comment = r#"
+    let review_url = "https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review";
+    let mut comment = format!(
+        r#"
 ### Reviews
-See [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.
+See [the guideline]({review_url}) for information on the review process.
 "#
-    .to_string();
-
+    );
     if reviews.is_empty() {
         comment += "A summary of reviews will appear here.\n";
     } else {
@@ -170,7 +175,12 @@ struct GitHubReviewComment {
     date: chrono::DateTime<chrono::Utc>,
 }
 
-async fn refresh_summary_comment(ctx: &Context, repo: Repository, pr_number: u64) -> Result<()> {
+async fn refresh_summary_comment(
+    ctx: &Context,
+    repo: Repository,
+    pr_number: u64,
+    llm_diff_pr: Option<String>,
+) -> Result<()> {
     println!("Refresh summary comment for {pr_number}");
     let issues_api = ctx.octocrab.issues(&repo.owner, &repo.name);
     let pulls_api = ctx.octocrab.pulls(&repo.owner, &repo.name);
@@ -206,6 +216,42 @@ For details see: https://corecheck.dev/{owner}/{repo}/pulls/{pull_num}.
             )
             .await?;
         }
+    }
+
+    if let Some(url) = llm_diff_pr {
+        let mut text = "".to_string();
+        match get_llm_check(&url, &ctx.llm_token).await {
+            Ok(reply) => {
+                if reply.contains("No typos were found") {
+                    // text remains empty
+                } else {
+                    let section = r#"
+### LLM Linter (✨ experimental)
+
+Possible typos and grammar issues:
+
+{llm_reply}
+
+<sup>drahtbot_id_{d_id}</sup>
+"#;
+                    text = section
+                        .replace("{llm_reply}", &reply)
+                        .replace("{d_id}", "4_m");
+                }
+            }
+            Err(err) => {
+                println!(" ... ERROR when requesting llm check {:?}", err);
+                // text remains empty
+            }
+        }
+        util::update_metadata_comment(
+            &issues_api,
+            &mut cmt,
+            &text,
+            util::IdComment::SecLmCheck,
+            ctx.dry_run,
+        )
+        .await?;
     }
 
     let ignored_users = if let Some(cmt_id) = cmt.id {
@@ -266,7 +312,7 @@ For details see: https://corecheck.dev/{owner}/{repo}/pulls/{pull_num}.
         }
         if let Some(ac) = parse_review(&comment.body) {
             let v = user_reviews.entry(comment.user.clone()).or_default();
-            let has_current_head = ac.commit.map_or(false, |c| head_commit.starts_with(&c));
+            let has_current_head = ac.commit.is_some_and(|c| head_commit.starts_with(&c));
             v.push(Review {
                 user: comment.user.clone(),
                 ack_type: if ignored_users.contains(&comment.user) {
@@ -391,7 +437,7 @@ impl AckType {
             AckType::ApproachAck => "Approach ACK",
             AckType::ApproachNack => "Approach NACK",
             AckType::StaleAck => "Stale ACK",
-            AckType::Ignored => "Ignored review",
+            AckType::Ignored => "User requested bot ignore",
         }
     }
 }
@@ -439,6 +485,81 @@ fn parse_review(comment: &str) -> Option<AckCommit> {
         }
     }
     None
+}
+
+async fn get_llm_check(llm_diff_pr: &str, llm_token: &str) -> Result<String> {
+    let client = reqwest::Client::new();
+    println!(" ... Run LLM check.");
+    let diff = client.get(llm_diff_pr).send().await?.text().await?;
+
+    let diff = diff
+        .lines()
+        .filter(|line| !line.starts_with('-') && !line.starts_with('@'))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let payload = serde_json::json!({
+      "model": "o4-mini",
+      "messages": [
+        {
+          "role": "developer",
+          "content": [
+            {
+              "type": "text",
+              "text":r#"
+Identify and provide feedback on typographic or grammatical errors in the provided git diff comments or documentation, focusing exclusively on errors impacting comprehension.
+
+- Only address errors that make the English text invalid or incomprehensible.
+- Ignore style preferences, such as the Oxford comma, missing or superfluous commas, awkward but harmless language, and missing or inconsistent punctuation.
+- Focus solely on lines added (starting with a + in the diff).
+- Address only code comments (for example C++ or Python comments) or documentation (for example markdown).
+- If no errors are found, state that no typos were found.
+
+# Output Format
+
+List each error with minimal context, followed by a very brief rationale:
+- typo -> replacement [explanation]
+
+If none are found, state: "No typos were found".
+"#
+    }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text":diff
+              }
+          ]
+        }
+      ],
+      "response_format": {
+        "type": "text"
+      },
+      "reasoning_effort": "low",
+      "service_tier": "flex",
+      "store": true
+    });
+    let response = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", llm_token))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    let mut text = response["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or(DrahtBotError::KeyNotFound)?
+        .to_string();
+    if text.is_empty() {
+        println!("ERROR: empty llm response: {response}");
+        text = "No typos were found".to_string();
+    }
+    Ok(text)
 }
 
 // Test that parse_review works

@@ -4,6 +4,7 @@ use crate::errors::Result;
 use crate::Context;
 use crate::GitHubEvent;
 use async_trait::async_trait;
+use octocrab::models::AuthorAssociation::{FirstTimeContributor, FirstTimer, Mannequin, None};
 
 pub struct LabelsFeature {
     meta: FeatureMeta,
@@ -80,13 +81,17 @@ impl Feature for LabelsFeature {
                     let pr_number = payload["number"]
                         .as_u64()
                         .ok_or(DrahtBotError::KeyNotFound)?;
+                    let pr_title = payload["pull_request"]["title"]
+                        .as_str()
+                        .ok_or(DrahtBotError::KeyNotFound)?;
                     let issues_api = ctx.octocrab.issues(repo_user, repo_name);
                     let pulls_api = ctx.octocrab.pulls(repo_user, repo_name);
-                    comment_archive(
+                    spam_detection(
                         &ctx.octocrab,
                         &issues_api,
                         &pulls_api,
                         pr_number,
+                        pr_title,
                         ctx.dry_run,
                     )
                     .await?;
@@ -98,11 +103,12 @@ impl Feature for LabelsFeature {
     }
 }
 
-async fn comment_archive(
+async fn spam_detection(
     github: &octocrab::Octocrab,
     issues_api: &octocrab::issues::IssueHandler<'_>,
     pulls_api: &octocrab::pulls::PullRequestHandler<'_>,
     pr_number: u64,
+    pr_title: &str,
     dry_run: bool,
 ) -> Result<()> {
     let all_files = github
@@ -115,6 +121,32 @@ async fn comment_archive(
         let text = "📁 Archived release notes are archived and should not be modified.";
         if !dry_run {
             issues_api.create_comment(pr_number, text).await?;
+        }
+    }
+    if all_files.iter().any(|f| {
+        let sw = |p| f.filename.starts_with(p);
+        sw("README.md")
+            || sw("CONTRIBUTING.md")
+            || sw("LICENSE")
+            || sw(".devcontainer/devcontainer.json")
+            || sw("SECURITY.md")
+            || sw("INSTALL.md")
+    }) || pr_title.starts_with("Create ") && all_files.len() == 1
+    {
+        let pull_request = pulls_api.get(pr_number).await?;
+        if [FirstTimer, FirstTimeContributor, Mannequin, None]
+            .contains(&pull_request.author_association.unwrap())
+        {
+            let reason =
+                "♻️ Automatically closing for now based on heuristics. Please leave a comment, if this was erroneous. Generally, please focus on creating high-quality, original content that demonstrates a clear understanding of the project's requirements and goals.";
+            if !dry_run {
+                issues_api.create_comment(pr_number, reason).await?;
+                issues_api
+                    .update(pr_number)
+                    .state(octocrab::models::IssueState::Closed)
+                    .send()
+                    .await?;
+            }
         }
     }
     Ok(())
